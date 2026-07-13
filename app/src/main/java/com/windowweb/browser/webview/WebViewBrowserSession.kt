@@ -2,6 +2,7 @@ package com.windowweb.browser.webview
 
 import android.webkit.WebView
 import com.windowweb.browser.core.BrowserSession
+import com.windowweb.browser.util.BrowserUserAgent
 import com.windowweb.browser.util.UrlInputParser
 
 class WebViewBrowserSession(
@@ -44,9 +45,9 @@ class WebViewBrowserSession(
         webView.settings.useWideViewPort = true
         webView.settings.loadWithOverviewMode = enabled
         webView.settings.userAgentString = if (enabled) {
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 WindowWeb/0.4"
+            BrowserUserAgent.desktop(webView.context)
         } else {
-            android.webkit.WebSettings.getDefaultUserAgent(webView.context) + " WindowWeb/0.4"
+            BrowserUserAgent.mobile(webView.context)
         }
     }
 

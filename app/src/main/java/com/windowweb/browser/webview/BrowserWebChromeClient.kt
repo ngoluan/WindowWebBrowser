@@ -2,6 +2,7 @@ package com.windowweb.browser.webview
 
 import android.net.Uri
 import android.os.Message
+import android.util.Log
 import android.webkit.ConsoleMessage
 import android.webkit.PermissionRequest
 import android.webkit.ValueCallback
@@ -68,10 +69,18 @@ class BrowserWebChromeClient(
     }
 
     override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
+        val level = consoleMessage.messageLevel().toConsoleLevel()
+        val rendered = "${consoleMessage.message()} — ${consoleMessage.sourceId()}:${consoleMessage.lineNumber()}"
+        when (level) {
+            ConsoleLevel.ERROR -> Log.e("WindowWebConsole", rendered)
+            ConsoleLevel.WARNING -> Log.w("WindowWebConsole", rendered)
+            ConsoleLevel.INFO -> Log.i("WindowWebConsole", rendered)
+            ConsoleLevel.DEBUG, ConsoleLevel.LOG -> Log.d("WindowWebConsole", rendered)
+        }
         onConsoleEntry(
             ConsoleEntry(
                 tabId = tabId,
-                level = consoleMessage.messageLevel().toConsoleLevel(),
+                level = level,
                 message = consoleMessage.message(),
                 source = consoleMessage.sourceId(),
                 lineNumber = consoleMessage.lineNumber()

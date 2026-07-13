@@ -13,7 +13,7 @@ android {
         minSdk = 26
         targetSdk = 36
         versionCode = 1
-        versionName = "0.4.0-desktop-zoom-hardening"
+        versionName = "0.5.4-native-dev-transport"
     }
 
     buildTypes {
@@ -76,4 +76,5 @@ dependencies {
     implementation("androidx.core:core-ktx:1.17.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
+    testImplementation("junit:junit:4.13.2")
 }

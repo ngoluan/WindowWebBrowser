@@ -1,6 +1,12 @@
 package com.windowweb.browser.ui
 
+import android.annotation.SuppressLint
+import android.content.Context
+import android.util.Log
+import android.net.http.SslError
+import android.webkit.HttpAuthHandler
 import android.webkit.PermissionRequest
+import android.webkit.SslErrorHandler
 import android.webkit.WebView
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -11,6 +17,8 @@ import com.windowweb.browser.core.BrowserNavigationState
 import com.windowweb.browser.core.BrowserSession
 import com.windowweb.browser.core.ConsoleEntry
 import com.windowweb.browser.core.ConsoleLevel
+import com.windowweb.browser.core.DevTlsPrompt
+import com.windowweb.browser.core.HttpAuthPrompt
 import com.windowweb.browser.core.NetworkEntry
 import com.windowweb.browser.core.PermissionDecision
 import com.windowweb.browser.core.PermissionPrompt
@@ -26,6 +34,9 @@ import com.windowweb.browser.data.TabEntity
 import com.windowweb.browser.data.WebAppEntity
 import com.windowweb.browser.data.WindowEntity
 import com.windowweb.browser.data.WorkspaceCheckpointEntity
+import com.windowweb.browser.util.DevServerTrustStore
+import com.windowweb.browser.util.UrlInputParser
+import com.windowweb.browser.webview.BrowserPageDiagnostics
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -37,6 +48,17 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
+private data class PendingHttpAuthRequest(
+    val tabId: String,
+    val handler: HttpAuthHandler
+)
+
+private data class PendingSslRequest(
+    val tabId: String,
+    val handler: SslErrorHandler,
+    val host: String
+)
+
 private data class RuntimeState(
     val navigationByTab: Map<String, BrowserNavigationState> = emptyMap(),
     val addressDraftByWindow: Map<String, String> = emptyMap(),
@@ -46,6 +68,8 @@ private data class RuntimeState(
     val commandSheetWindowId: String? = null,
     val commandSheetExpanded: Boolean = false,
     val permissionPrompt: PermissionPrompt? = null,
+    val httpAuthPrompt: HttpAuthPrompt? = null,
+    val devTlsPrompt: DevTlsPrompt? = null,
     val externalUrlPrompt: String? = null,
     val consoleFilter: String = "",
     val jsInput: String = "",
@@ -79,6 +103,8 @@ data class BrowserUiState(
     val commandSheetWindowId: String? = null,
     val commandSheetExpanded: Boolean = false,
     val permissionPrompt: PermissionPrompt? = null,
+    val httpAuthPrompt: HttpAuthPrompt? = null,
+    val devTlsPrompt: DevTlsPrompt? = null,
     val externalUrlPrompt: String? = null,
     val consoleEntries: List<ConsoleLogEntity> = emptyList(),
     val networkEntries: List<NetworkLogEntity> = emptyList(),
@@ -100,13 +126,17 @@ data class BrowserUiState(
 }
 
 class BrowserViewModel(
-    private val repository: SessionRepository
+    private val repository: SessionRepository,
+    private val applicationContext: Context
 ) : ViewModel() {
 
     private val runtime = MutableStateFlow(RuntimeState())
     private val sessions = mutableMapOf<String, BrowserSession>()
     private val pendingLoads = mutableMapOf<String, String>()
     private val pendingPermissionRequests = mutableMapOf<String, PermissionRequest>()
+    private val pendingHttpAuthRequests = mutableMapOf<String, PendingHttpAuthRequest>()
+    private val pendingSslRequests = mutableMapOf<String, PendingSslRequest>()
+    private val recentConsoleFingerprints = LinkedHashMap<String, Long>()
 
     private val activeTabFlow = repository.observeActiveTab()
 
@@ -120,6 +150,7 @@ class BrowserViewModel(
         if (tab == null) flowOf(emptyList()) else repository.observeNetworkForTab(tab.id)
     }
 
+    @Suppress("UNCHECKED_CAST")
     val state: StateFlow<BrowserUiState> = combine(
         repository.observeWindowsForActiveWorkspace(),
         repository.observeAllTabs(),
@@ -146,7 +177,7 @@ class BrowserViewModel(
         val checkpoint = values[9] as WorkspaceCheckpointEntity?
         val webApps = values[10] as List<WebAppEntity>
         val runtimeState = values[11] as RuntimeState
-        val focused = windows.filterNot { it.minimized }.maxByOrNull { it.zIndex }
+        val focused = windows.asSequence().filterNot { it.minimized }.maxByOrNull { it.zIndex }
 
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG || settings.remoteDebuggingEnabled)
 
@@ -163,6 +194,8 @@ class BrowserViewModel(
             commandSheetWindowId = runtimeState.commandSheetWindowId,
             commandSheetExpanded = runtimeState.commandSheetExpanded,
             permissionPrompt = runtimeState.permissionPrompt,
+            httpAuthPrompt = runtimeState.httpAuthPrompt,
+            devTlsPrompt = runtimeState.devTlsPrompt,
             externalUrlPrompt = runtimeState.externalUrlPrompt,
             consoleEntries = consoleEntries,
             networkEntries = networkEntries,
@@ -264,6 +297,8 @@ class BrowserViewModel(
 
     fun closeTab(tabId: String) {
         sessions.remove(tabId)
+        cancelPendingHttpAuthRequestsForTab(tabId)
+        cancelPendingSslRequestsForTab(tabId)
         viewModelScope.launch { repository.closeTab(tabId) }
     }
 
@@ -285,7 +320,11 @@ class BrowserViewModel(
 
     fun closeWindow(windowId: String) {
         val tabIds = state.value.tabs.filter { it.windowId == windowId }.map { it.id }
-        tabIds.forEach { sessions.remove(it) }
+        tabIds.forEach {
+            sessions.remove(it)
+            cancelPendingHttpAuthRequestsForTab(it)
+            cancelPendingSslRequestsForTab(it)
+        }
         viewModelScope.launch { repository.closeWindow(windowId) }
     }
 
@@ -308,7 +347,59 @@ class BrowserViewModel(
     }
 
     fun resizeWindow(windowId: String, width: Float, height: Float) {
-        viewModelScope.launch { repository.resizeWindow(windowId, width.coerceIn(0.32f, 1f), height.coerceIn(0.28f, 1f)) }
+        viewModelScope.launch { repository.resizeWindow(windowId, width.coerceIn(0.22f, 1f), height.coerceIn(0.18f, 1f)) }
+    }
+
+    fun updateWindowBounds(
+        windowId: String,
+        x: Float,
+        y: Float,
+        width: Float,
+        height: Float
+    ) {
+        viewModelScope.launch {
+            repository.updateWindowBounds(windowId, x, y, width, height)
+        }
+    }
+
+    fun duplicateWindow(windowId: String) {
+        viewModelScope.launch { repository.duplicateWindow(windowId) }
+    }
+
+    fun setWindowPinned(windowId: String, pinned: Boolean) {
+        viewModelScope.launch { repository.setWindowPinned(windowId, pinned) }
+    }
+
+    fun setWindowOpacity(windowId: String, opacity: Float) {
+        viewModelScope.launch { repository.setWindowOpacity(windowId, opacity) }
+    }
+
+    fun setWindowLayoutLocked(windowId: String, locked: Boolean) {
+        viewModelScope.launch { repository.setWindowLayoutLocked(windowId, locked) }
+    }
+
+    fun collectWindows() {
+        viewModelScope.launch { repository.collectWindows() }
+    }
+
+    fun tileWindows() {
+        viewModelScope.launch { repository.tileWindows() }
+    }
+
+    fun cascadeWindows() {
+        viewModelScope.launch { repository.cascadeWindows() }
+    }
+
+    fun stackWindows() {
+        viewModelScope.launch { repository.stackWindows() }
+    }
+
+    fun minimizeAllWindows() {
+        viewModelScope.launch { repository.minimizeAllWindows() }
+    }
+
+    fun restoreAllWindows() {
+        viewModelScope.launch { repository.restoreAllWindows() }
     }
 
     fun setChromeMode(windowId: String, mode: BrowserChromeMode) {
@@ -337,6 +428,92 @@ class BrowserViewModel(
         runtime.update { it.copy(externalUrlPrompt = null) }
     }
 
+    fun onHttpAuthRequest(
+        tabId: String,
+        handler: HttpAuthHandler,
+        host: String,
+        realm: String?
+    ) {
+        runtime.value.httpAuthPrompt?.requestId?.let { existingId ->
+            pendingHttpAuthRequests.remove(existingId)?.handler?.cancel()
+        }
+
+        val prompt = HttpAuthPrompt(
+            tabId = tabId,
+            host = host,
+            realm = realm
+        )
+        pendingHttpAuthRequests[prompt.requestId] = PendingHttpAuthRequest(tabId, handler)
+        runtime.update { it.copy(httpAuthPrompt = prompt) }
+    }
+
+    fun respondHttpAuth(
+        prompt: HttpAuthPrompt,
+        username: String?,
+        password: String?
+    ) {
+        val pending = pendingHttpAuthRequests.remove(prompt.requestId)
+        if ((!username.isNullOrBlank()) && (password != null)) {
+            pending?.handler?.proceed(username, password)
+        } else {
+            pending?.handler?.cancel()
+        }
+        runtime.update { current ->
+            if (current.httpAuthPrompt?.requestId == prompt.requestId) {
+                current.copy(httpAuthPrompt = null)
+            } else {
+                current
+            }
+        }
+    }
+
+    fun isTrustedDevServer(host: String): Boolean =
+        DevServerTrustStore.isTrusted(applicationContext, host)
+
+    fun onSslErrorRequest(
+        tabId: String,
+        handler: SslErrorHandler,
+        error: SslError,
+        host: String
+    ) {
+        runtime.value.devTlsPrompt?.requestId?.let { existingId ->
+            pendingSslRequests.remove(existingId)?.handler?.cancel()
+        }
+
+        val prompt = DevTlsPrompt(
+            tabId = tabId,
+            url = error.url.orEmpty(),
+            host = host,
+            reason = sslErrorReason(error.primaryError)
+        )
+        pendingSslRequests[prompt.requestId] = PendingSslRequest(tabId, handler, host)
+        runtime.update { it.copy(devTlsPrompt = prompt) }
+    }
+
+    @SuppressLint("WebViewClientOnReceivedSslError")
+    fun respondDevTls(prompt: DevTlsPrompt, allow: Boolean, remember: Boolean) {
+        val pending = pendingSslRequests.remove(prompt.requestId)
+        if (allow) {
+            if (remember) {
+                DevServerTrustStore.trust(applicationContext, pending?.host ?: prompt.host)
+            }
+            pending?.handler?.proceed()
+        } else {
+            pending?.handler?.cancel()
+        }
+        runtime.update { current ->
+            if (current.devTlsPrompt?.requestId == prompt.requestId) {
+                current.copy(devTlsPrompt = null)
+            } else {
+                current
+            }
+        }
+    }
+
+    fun clearTrustedDevServers() {
+        DevServerTrustStore.clear(applicationContext)
+    }
+
     fun toggleOverview() {
         runtime.update { it.copy(overviewVisible = !it.overviewVisible, launcherVisible = false) }
     }
@@ -350,7 +527,41 @@ class BrowserViewModel(
     }
 
     fun showPanel(panel: BrowserPanel) {
-        runtime.update { it.copy(panel = if (it.panel == panel) BrowserPanel.NONE else panel, commandSheetWindowId = null, commandSheetExpanded = false, launcherVisible = false) }
+        if (panel == BrowserPanel.CONSOLE) {
+            showConsole()
+            return
+        }
+        runtime.update {
+            it.copy(
+                panel = if (it.panel == panel) BrowserPanel.NONE else panel,
+                commandSheetWindowId = null,
+                commandSheetExpanded = false,
+                launcherVisible = false
+            )
+        }
+    }
+
+    fun showConsole() {
+        val opening = runtime.value.panel != BrowserPanel.CONSOLE
+        runtime.update {
+            it.copy(
+                panel = if (opening) BrowserPanel.CONSOLE else BrowserPanel.NONE,
+                commandSheetWindowId = null,
+                commandSheetExpanded = false,
+                launcherVisible = false
+            )
+        }
+        if (opening) {
+            viewModelScope.launch {
+                repository.updateSettings { current ->
+                    current.copy(
+                        developerModeEnabled = true,
+                        captureConsoleEnabled = true
+                    )
+                }
+            }
+            runPageDiagnostics()
+        }
     }
 
     fun closePanel() {
@@ -359,6 +570,7 @@ class BrowserViewModel(
 
     fun clearConsole() {
         val tabId = state.value.activeTab?.id ?: return
+        recentConsoleFingerprints.keys.removeAll { it.startsWith("$tabId|") }
         viewModelScope.launch { repository.clearConsole(tabId) }
     }
 
@@ -386,6 +598,28 @@ class BrowserViewModel(
             )
         }
         runtime.update { it.copy(jsInput = "") }
+    }
+
+    fun runPageDiagnostics() {
+        val tabId = state.value.activeTab?.id ?: return
+        val sourceUrl = state.value.navigationByTab[tabId]?.url
+            ?: state.value.activeTab?.url
+        val session = sessions[tabId]
+        if (session == null) {
+            onDiagnosticEntry(
+                ConsoleEntry(
+                    tabId = tabId,
+                    level = ConsoleLevel.WARNING,
+                    message = "${BrowserPageDiagnostics.PREFIX} diagnostic unavailable: the tab WebView is paused or discarded.",
+                    source = BrowserPageDiagnostics.SOURCE,
+                    lineNumber = null
+                )
+            )
+            return
+        }
+        session.evaluateJavaScript(BrowserPageDiagnostics.snapshotScript) { result ->
+            onDiagnosticEntry(BrowserPageDiagnostics.consoleEntry(tabId, result, sourceUrl))
+        }
     }
 
     fun clearNetwork() {
@@ -482,6 +716,7 @@ class BrowserViewModel(
     }
 
     fun onCreateWindowRequest(tabId: String, url: String?) {
+        Log.d("BrowserViewModel", "Create window request from tab $tabId for $url")
         viewModelScope.launch {
             repository.createWindow(url?.takeIf { it.isNotBlank() } ?: "https://www.google.com")
         }
@@ -496,7 +731,16 @@ class BrowserViewModel(
         runtime.update { current ->
             val previous = current.navigationByTab[tabId] ?: BrowserNavigationState()
             current.copy(
-                navigationByTab = current.navigationByTab + (tabId to previous.copy(url = resolvedUrl, loading = true, progress = 0, errorDescription = null))
+                navigationByTab = current.navigationByTab + (
+                    tabId to previous.copy(
+                        url = resolvedUrl,
+                        loading = true,
+                        progress = 0,
+                        errorDescription = null,
+                        errorCode = null,
+                        suggestedUrl = null
+                    )
+                )
             )
         }
         viewModelScope.launch { repository.updateTabNavigation(tabId, resolvedUrl, null, loading = true) }
@@ -522,20 +766,38 @@ class BrowserViewModel(
         }
     }
 
-    fun onPageError(tabId: String, url: String?, description: String?) {
+    fun onPageError(tabId: String, url: String?, description: String?, errorCode: Int?) {
         runtime.update { current ->
             val previous = current.navigationByTab[tabId] ?: BrowserNavigationState()
+            val failingUrl = url ?: previous.url
             current.copy(
                 navigationByTab = current.navigationByTab + (
                     tabId to previous.copy(
-                        url = url ?: previous.url,
+                        url = failingUrl,
                         loading = false,
                         progress = 100,
-                        errorDescription = description ?: "The page could not be loaded."
+                        errorDescription = description ?: "The page could not be loaded.",
+                        errorCode = errorCode,
+                        suggestedUrl = if (
+                            errorCode == android.webkit.WebViewClient.ERROR_FAILED_SSL_HANDSHAKE &&
+                            description?.contains("ERR_SSL_PROTOCOL_ERROR", ignoreCase = true) == true
+                        ) {
+                            UrlInputParser.httpFallback(failingUrl)
+                        } else {
+                            null
+                        }
                     )
                 )
             )
         }
+    }
+
+    fun loadSuggestedUrl(windowId: String) {
+        val tabId = activeTabId(windowId) ?: return
+        val suggestedUrl = state.value.navigationByTab[tabId]?.suggestedUrl ?: return
+        updateAddressText(windowId, suggestedUrl)
+        restoreDiscardedTab(tabId)
+        loadInTab(tabId, suggestedUrl)
     }
 
     fun onNavigationStateChanged(tabId: String, canGoBack: Boolean, canGoForward: Boolean) {
@@ -548,7 +810,21 @@ class BrowserViewModel(
     }
 
     fun onConsoleEntry(entry: ConsoleEntry) {
-        if (!state.value.settings.captureConsoleEnabled) return
+        if (isBenignConsoleNoise(entry.message)) return
+
+        val current = state.value
+        val important = entry.level == ConsoleLevel.ERROR || entry.level == ConsoleLevel.WARNING
+        val captureEnabled = current.settings.captureConsoleEnabled ||
+            current.settings.developerModeEnabled ||
+            current.panel == BrowserPanel.CONSOLE
+        if (!important && !captureEnabled) return
+        if (isDuplicateConsoleEntry(entry)) return
+
+        viewModelScope.launch { repository.appendConsole(entry) }
+    }
+
+    fun onDiagnosticEntry(entry: ConsoleEntry) {
+        if (isDuplicateConsoleEntry(entry)) return
         viewModelScope.launch { repository.appendConsole(entry) }
     }
 
@@ -606,7 +882,21 @@ class BrowserViewModel(
     fun startFreshWorkspace() {
         sessions.clear()
         pendingLoads.clear()
-        runtime.update { it.copy(recoveryBannerDismissed = true, launcherVisible = false, overviewVisible = false, commandSheetExpanded = false, panel = BrowserPanel.NONE) }
+        pendingHttpAuthRequests.values.forEach { it.handler.cancel() }
+        pendingHttpAuthRequests.clear()
+        pendingSslRequests.values.forEach { it.handler.cancel() }
+        pendingSslRequests.clear()
+        runtime.update {
+            it.copy(
+                recoveryBannerDismissed = true,
+                launcherVisible = false,
+                overviewVisible = false,
+                commandSheetExpanded = false,
+                panel = BrowserPanel.NONE,
+                httpAuthPrompt = null,
+                devTlsPrompt = null
+            )
+        }
         viewModelScope.launch { repository.startFreshWorkspace() }
     }
 
@@ -669,13 +959,101 @@ class BrowserViewModel(
         viewModelScope.launch { repository.deleteWebApp(appId) }
     }
 
+    private fun isBenignConsoleNoise(message: String): Boolean {
+        return message.contains(
+            "Autofocus processing was blocked because a document already has a focused element",
+            ignoreCase = true
+        )
+    }
+
+    private fun isDuplicateConsoleEntry(entry: ConsoleEntry): Boolean {
+        val now = System.currentTimeMillis()
+        val fingerprint = buildString {
+            append(entry.tabId)
+            append('|')
+            append(entry.level.name)
+            append('|')
+            append(entry.message)
+            append('|')
+            append(entry.source.orEmpty())
+            append('|')
+            append(entry.lineNumber ?: 0)
+        }
+        val previous = recentConsoleFingerprints[fingerprint]
+        recentConsoleFingerprints[fingerprint] = now
+
+        val iterator = recentConsoleFingerprints.entries.iterator()
+        while (iterator.hasNext()) {
+            val item = iterator.next()
+            if (now - item.value > 5_000L || recentConsoleFingerprints.size > 250) {
+                iterator.remove()
+            }
+        }
+        return previous != null && now - previous < 1_000L
+    }
+
     private fun activeTabId(windowId: String): String? = state.value.windows.firstOrNull { it.id == windowId }?.activeTabId
 
-    class Factory(private val repository: SessionRepository) : ViewModelProvider.Factory {
+    private fun cancelPendingHttpAuthRequestsForTab(tabId: String) {
+        val requestIds = pendingHttpAuthRequests
+            .filterValues { it.tabId == tabId }
+            .keys
+            .toList()
+        requestIds.forEach { requestId ->
+            pendingHttpAuthRequests.remove(requestId)?.handler?.cancel()
+            runtime.update { current ->
+                if (current.httpAuthPrompt?.requestId == requestId) {
+                    current.copy(httpAuthPrompt = null)
+                } else {
+                    current
+                }
+            }
+        }
+    }
+
+    private fun cancelPendingSslRequestsForTab(tabId: String) {
+        val requestIds = pendingSslRequests
+            .filterValues { it.tabId == tabId }
+            .keys
+            .toList()
+        requestIds.forEach { requestId ->
+            pendingSslRequests.remove(requestId)?.handler?.cancel()
+            runtime.update { current ->
+                if (current.devTlsPrompt?.requestId == requestId) {
+                    current.copy(devTlsPrompt = null)
+                } else {
+                    current
+                }
+            }
+        }
+    }
+
+    private fun sslErrorReason(primaryError: Int): String = when (primaryError) {
+        SslError.SSL_EXPIRED -> "The certificate has expired."
+        SslError.SSL_IDMISMATCH -> "The certificate does not match this host."
+        SslError.SSL_NOTYETVALID -> "The certificate is not valid yet."
+        SslError.SSL_UNTRUSTED -> "The certificate authority is not trusted, which is common for self-signed development certificates."
+        SslError.SSL_DATE_INVALID -> "The certificate date is invalid."
+        SslError.SSL_INVALID -> "The certificate is invalid."
+        else -> "The TLS certificate could not be validated."
+    }
+
+    override fun onCleared() {
+        pendingHttpAuthRequests.values.forEach { it.handler.cancel() }
+        pendingHttpAuthRequests.clear()
+        pendingSslRequests.values.forEach { it.handler.cancel() }
+        pendingSslRequests.clear()
+        super.onCleared()
+    }
+
+    class Factory(
+        private val repository: SessionRepository,
+        private val applicationContext: Context
+    ) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T {
             if (modelClass.isAssignableFrom(BrowserViewModel::class.java)) {
-                return BrowserViewModel(repository) as T
+                return BrowserViewModel(repository, applicationContext.applicationContext) as T
             }
             throw IllegalArgumentException("Unknown ViewModel: ${modelClass.name}")
         }

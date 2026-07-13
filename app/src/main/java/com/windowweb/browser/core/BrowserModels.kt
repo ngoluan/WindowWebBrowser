@@ -42,9 +42,27 @@ enum class SnapPosition {
     RIGHT,
     TOP,
     BOTTOM,
+    TOP_LEFT,
+    TOP_RIGHT,
+    BOTTOM_LEFT,
+    BOTTOM_RIGHT,
+    LEFT_THIRD,
+    CENTER_THIRD,
+    RIGHT_THIRD,
     PICTURE_IN_PICTURE,
     MAXIMIZE,
     FLOATING
+}
+
+enum class ResizeEdge {
+    LEFT,
+    RIGHT,
+    TOP,
+    BOTTOM,
+    TOP_LEFT,
+    TOP_RIGHT,
+    BOTTOM_LEFT,
+    BOTTOM_RIGHT
 }
 
 enum class PermissionDecision {
@@ -70,7 +88,9 @@ data class BrowserNavigationState(
     val loading: Boolean = false,
     val canGoBack: Boolean = false,
     val canGoForward: Boolean = false,
-    val errorDescription: String? = null
+    val errorDescription: String? = null,
+    val errorCode: Int? = null,
+    val suggestedUrl: String? = null
 )
 
 data class NetworkEntry(
@@ -80,6 +100,21 @@ data class NetworkEntry(
     val method: String,
     val resourceType: String,
     val timestamp: Long = System.currentTimeMillis()
+)
+
+data class HttpAuthPrompt(
+    val tabId: String,
+    val host: String,
+    val realm: String?,
+    val requestId: String = UUID.randomUUID().toString()
+)
+
+data class DevTlsPrompt(
+    val tabId: String,
+    val url: String,
+    val host: String,
+    val reason: String,
+    val requestId: String = UUID.randomUUID().toString()
 )
 
 data class PermissionPrompt(

@@ -3,8 +3,10 @@ package com.windowweb.browser.data
 import com.windowweb.browser.core.BrowserChromeMode
 import com.windowweb.browser.core.ConsoleEntry
 import com.windowweb.browser.core.NetworkEntry
+import com.windowweb.browser.core.NormalizedWindowBounds
 import com.windowweb.browser.core.PermissionDecision
 import com.windowweb.browser.core.SnapPosition
+import com.windowweb.browser.core.WindowGeometry
 import com.windowweb.browser.core.WindowMode
 import java.net.URI
 import com.windowweb.browser.util.Ids
@@ -278,30 +280,34 @@ class SessionRepository(
     }
 
     suspend fun snapWindow(windowId: String, snap: SnapPosition) {
-        data class BoundsAndMode(
-            val x: Float,
-            val y: Float,
-            val width: Float,
-            val height: Float,
-            val mode: String
-        )
+        val window = windowDao.getById(windowId) ?: return
+        if (window.layoutLocked) return
 
-        val bounds = when (snap) {
-            SnapPosition.LEFT -> BoundsAndMode(0f, 0f, 0.5f, 1f, WindowMode.SPLIT_LEFT.name)
-            SnapPosition.RIGHT -> BoundsAndMode(0.5f, 0f, 0.5f, 1f, WindowMode.SPLIT_RIGHT.name)
-            SnapPosition.TOP -> BoundsAndMode(0f, 0f, 1f, 0.5f, WindowMode.SPLIT_TOP.name)
-            SnapPosition.BOTTOM -> BoundsAndMode(0f, 0.5f, 1f, 0.5f, WindowMode.SPLIT_BOTTOM.name)
-            SnapPosition.PICTURE_IN_PICTURE -> BoundsAndMode(0.58f, 0.56f, 0.38f, 0.34f, WindowMode.PICTURE_IN_PICTURE.name)
-            SnapPosition.MAXIMIZE -> BoundsAndMode(0f, 0f, 1f, 1f, WindowMode.MAXIMIZED.name)
-            SnapPosition.FLOATING -> BoundsAndMode(0.08f, 0.08f, 0.84f, 0.76f, WindowMode.FLOATING.name)
+        val bounds = WindowGeometry.snap(snap)
+        val mode = when (snap) {
+            SnapPosition.LEFT -> WindowMode.SPLIT_LEFT
+            SnapPosition.RIGHT -> WindowMode.SPLIT_RIGHT
+            SnapPosition.TOP -> WindowMode.SPLIT_TOP
+            SnapPosition.BOTTOM -> WindowMode.SPLIT_BOTTOM
+            SnapPosition.PICTURE_IN_PICTURE -> WindowMode.PICTURE_IN_PICTURE
+            SnapPosition.MAXIMIZE -> WindowMode.MAXIMIZED
+            SnapPosition.FLOATING,
+            SnapPosition.TOP_LEFT,
+            SnapPosition.TOP_RIGHT,
+            SnapPosition.BOTTOM_LEFT,
+            SnapPosition.BOTTOM_RIGHT,
+            SnapPosition.LEFT_THIRD,
+            SnapPosition.CENTER_THIRD,
+            SnapPosition.RIGHT_THIRD -> WindowMode.FLOATING
         }
+
         windowDao.updateBoundsAndMode(
             windowId,
             bounds.x,
             bounds.y,
             bounds.width,
             bounds.height,
-            bounds.mode,
+            mode.name,
             false,
             System.currentTimeMillis()
         )
@@ -310,12 +316,173 @@ class SessionRepository(
 
     suspend fun moveWindow(windowId: String, x: Float, y: Float) {
         val window = windowDao.getById(windowId) ?: return
-        windowDao.updateBoundsAndMode(windowId, x, y, window.width, window.height, WindowMode.FLOATING.name, false, System.currentTimeMillis())
+        if (window.layoutLocked) return
+        updateBounds(windowId, WindowGeometry.move(window.toBounds(), x, y))
     }
 
     suspend fun resizeWindow(windowId: String, width: Float, height: Float) {
         val window = windowDao.getById(windowId) ?: return
-        windowDao.updateBoundsAndMode(windowId, window.x, window.y, width, height, WindowMode.FLOATING.name, false, System.currentTimeMillis())
+        if (window.layoutLocked) return
+        updateBounds(
+            windowId,
+            WindowGeometry.clamp(window.toBounds().copy(width = width, height = height))
+        )
+    }
+
+    suspend fun updateWindowBounds(
+        windowId: String,
+        x: Float,
+        y: Float,
+        width: Float,
+        height: Float
+    ) {
+        val window = windowDao.getById(windowId) ?: return
+        if (window.layoutLocked) return
+        updateBounds(
+            windowId,
+            WindowGeometry.clamp(NormalizedWindowBounds(x, y, width, height))
+        )
+    }
+
+    suspend fun duplicateWindow(windowId: String): String? {
+        val source = windowDao.getById(windowId) ?: return null
+        val tab = source.activeTabId?.let { tabDao.getById(it) }
+        val duplicatedId = createWindow(tab?.url ?: "https://www.google.com")
+        if (duplicatedId.isBlank()) return null
+
+        val duplicated = windowDao.getById(duplicatedId) ?: return duplicatedId
+        val duplicatedBounds = WindowGeometry.clamp(
+            NormalizedWindowBounds(
+                x = source.x + 0.04f,
+                y = source.y + 0.04f,
+                width = source.width,
+                height = source.height
+            )
+        )
+        windowDao.upsert(
+            duplicated.copy(
+                x = duplicatedBounds.x,
+                y = duplicatedBounds.y,
+                width = duplicatedBounds.width,
+                height = duplicatedBounds.height,
+                chromeMode = source.chromeMode,
+                desktopMode = source.desktopMode,
+                pageZoomPercent = source.pageZoomPercent,
+                textZoomPercent = source.textZoomPercent,
+                desktopViewportWidthDp = source.desktopViewportWidthDp,
+                opacity = source.opacity,
+                updatedAt = System.currentTimeMillis()
+            )
+        )
+        focusWindow(duplicatedId)
+        return duplicatedId
+    }
+
+    suspend fun setWindowPinned(windowId: String, pinned: Boolean) {
+        val window = windowDao.getById(windowId) ?: return
+        windowDao.upsert(window.copy(pinned = pinned, updatedAt = System.currentTimeMillis()))
+        if (pinned) focusWindow(windowId)
+    }
+
+    suspend fun setWindowOpacity(windowId: String, opacity: Float) {
+        val window = windowDao.getById(windowId) ?: return
+        windowDao.upsert(
+            window.copy(
+                opacity = opacity.coerceIn(0.35f, 1f),
+                updatedAt = System.currentTimeMillis()
+            )
+        )
+    }
+
+    suspend fun setWindowLayoutLocked(windowId: String, locked: Boolean) {
+        val window = windowDao.getById(windowId) ?: return
+        windowDao.upsert(window.copy(layoutLocked = locked, updatedAt = System.currentTimeMillis()))
+    }
+
+    suspend fun collectWindows() {
+        val windows = activeWorkspaceWindows().sortedBy { it.zIndex }
+        val now = System.currentTimeMillis()
+        windows.forEachIndexed { index, window ->
+            if (window.layoutLocked) return@forEachIndexed
+            val bounds = WindowGeometry.clamp(
+                NormalizedWindowBounds(
+                    x = 0.04f + (index % 5) * 0.025f,
+                    y = 0.04f + (index % 5) * 0.025f,
+                    width = window.width,
+                    height = window.height
+                )
+            )
+            windowDao.updateBoundsAndMode(
+                window.id,
+                bounds.x,
+                bounds.y,
+                bounds.width,
+                bounds.height,
+                WindowMode.FLOATING.name,
+                false,
+                now
+            )
+        }
+    }
+
+    suspend fun tileWindows() {
+        arrangeWindows { count -> WindowGeometry.tiled(count) }
+    }
+
+    suspend fun cascadeWindows() {
+        arrangeWindows { count -> WindowGeometry.cascaded(count) }
+    }
+
+    suspend fun stackWindows() {
+        arrangeWindows { count -> WindowGeometry.stacked(count) }
+    }
+
+    suspend fun minimizeAllWindows() {
+        activeWorkspaceWindows().filterNot { it.layoutLocked }.forEach { minimizeWindow(it.id) }
+    }
+
+    suspend fun restoreAllWindows() {
+        activeWorkspaceWindows().forEach { window ->
+            if (window.minimized) restoreWindow(window.id)
+        }
+    }
+
+    private suspend fun arrangeWindows(layout: (Int) -> List<NormalizedWindowBounds>) {
+        val windows = activeWorkspaceWindows()
+            .filterNot { it.minimized || it.layoutLocked }
+            .sortedBy { it.zIndex }
+        val bounds = layout(windows.size)
+        val now = System.currentTimeMillis()
+        windows.zip(bounds).forEach { (window, target) ->
+            windowDao.updateBoundsAndMode(
+                window.id,
+                target.x,
+                target.y,
+                target.width,
+                target.height,
+                WindowMode.FLOATING.name,
+                false,
+                now
+            )
+        }
+    }
+
+    private suspend fun activeWorkspaceWindows(): List<WindowEntity> {
+        val workspace = workspaceDao.getActiveWorkspace() ?: return emptyList()
+        return windowDao.getWindowsForWorkspace(workspace.id)
+    }
+
+    private suspend fun updateBounds(windowId: String, bounds: NormalizedWindowBounds) {
+        windowDao.updateBoundsAndMode(
+            windowId,
+            bounds.x,
+            bounds.y,
+            bounds.width,
+            bounds.height,
+            WindowMode.FLOATING.name,
+            false,
+            System.currentTimeMillis()
+        )
     }
 
     suspend fun setChromeMode(windowId: String, mode: BrowserChromeMode) {
@@ -599,3 +766,11 @@ class SessionRepository(
             updatedAt = now
         )
 }
+
+private fun WindowEntity.toBounds(): NormalizedWindowBounds =
+    NormalizedWindowBounds(
+        x = x,
+        y = y,
+        width = width,
+        height = height
+    )
